@@ -24,12 +24,26 @@ username+password to it, and the session cookie then authorises the API calls.
 import argparse
 import configparser
 import os
+import re
 import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
+
+# The dashboards to monitor (all share one username/password). Override with
+# the ANNEX_URLS env var (comma/space/newline separated) or [annex] urls in
+# config.ini. URLs are not secret, so they live here by default.
+DEFAULT_URLS = [
+    "https://annex.postpanel.info/",
+    "https://saj.postpanel.info/",
+    "https://oatext.postpanel.in/",
+    "https://annex.port25.app/",
+    "https://saj.port25.app/",
+    "https://oatext.port25.app/",
+]
 
 # Windows consoles default to cp1252 and can't print emoji; force UTF-8.
 try:
@@ -86,11 +100,23 @@ def load_config():
     return cfg
 
 
+def get_sites(cfg):
+    """Return the list of dashboard URLs to monitor."""
+    raw = os.environ.get("ANNEX_URLS") or cfg["annex"].get("urls", "")
+    urls = [u.strip() for u in re.split(r"[,\s]+", raw) if u.strip()]
+    return urls or list(DEFAULT_URLS)
+
+
+def site_label(url):
+    """Short readable name for a site, e.g. 'annex.postpanel.info'."""
+    return urlparse(url).netloc or url
+
+
 class Annex:
-    def __init__(self, cfg):
-        self.base = cfg["annex"]["base_url"].rstrip("/") + "/"
-        self.user = cfg["annex"]["username"]
-        self.pwd = cfg["annex"]["password"]
+    def __init__(self, base_url, user, pwd):
+        self.base = base_url.rstrip("/") + "/"
+        self.user = user
+        self.pwd = pwd
         self.api_url = self.base + "admin-dashboard-v2.php"
         self.s = requests.Session()
         self.s.headers.update({"User-Agent": USER_AGENT,
@@ -149,61 +175,56 @@ def n(x):
         return str(x if x is not None else "n/a")
 
 
-def build_summary(ds, stats, health):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    L = [f"\U0001F4E8 <b>Annex Daily Summary</b>  ({ts})", ""]
-
+def build_site_section(label, ds, stats, health):
+    """Compact per-site block for the combined message."""
     today = (ds or {}).get("today", {})
-    yest = (ds or {}).get("yesterday", {})
     month = (ds or {}).get("month", {})
+    L = [f"\U0001F310 <b>{label}</b>"]
 
-    L.append("<b>Emails sent</b>")
-    L.append(f"  • Today: <b>{n(today.get('emailsSent'))}</b>")
-    L.append(f"  • Yesterday: {n(yest.get('emailsSent'))}")
-    L.append(f"  • This month: {n(month.get('emailsSent'))}")
-    L.append("")
-
-    L.append("<b>Contacts uploaded</b>")
-    L.append(f"  • Today: <b>{n(today.get('contactsUploaded'))}</b>")
-    L.append(f"  • Yesterday: {n(yest.get('contactsUploaded'))}")
-    L.append(f"  • This month: {n(month.get('contactsUploaded'))}")
-    L.append("")
-
+    L.append(f"  \U0001F4E4 Sent: today <b>{n(today.get('emailsSent'))}</b> "
+             f"| month {n(month.get('emailsSent'))}")
+    L.append(f"  \U0001F4E5 Uploaded: today <b>{n(today.get('contactsUploaded'))}</b> "
+             f"| month {n(month.get('contactsUploaded'))}")
     if stats:
-        L.append("<b>Today's delivery</b>")
-        L.append(f"  • Sent: {n(stats.get('total_sent'))} | "
-                 f"Delivered: {n(stats.get('delivered'))} | "
-                 f"Pending: {n(stats.get('pending_count'))}")
-        L.append(f"  • Bounces: {n(stats.get('total_bounces'))} "
-                 f"(hard {n(stats.get('hard_bounces'))} / soft {n(stats.get('soft_bounces'))})")
-        L.append("")
+        L.append(f"  \U0001F4EC Delivered {n(stats.get('delivered'))} "
+                 f"| Pending {n(stats.get('pending_count'))} "
+                 f"| Bounces {n(stats.get('total_bounces'))}")
 
-    # --- blacklist status ---
-    L.append("<b>Domain blacklist status</b>")
+    # blacklist
     domains = (health or {}).get("domains") or []
     if (health or {}).get("error"):
-        L.append(f"  ! {health['error']}")
+        L.append(f"  \U0001F6E1 Blacklist: ! {health['error']}")
     elif not domains:
-        L.append("  • No sender domains configured.")
+        L.append("  \U0001F6E1 Blacklist: no domains configured")
     else:
         bad = []
         for d in domains:
             status = (d.get("blacklist_status") or "unknown").lower()
-            name = d.get("domain", "?")
             if status == "pass":
-                continue  # clean - only list problems below
+                continue
             icon = {"warning": "⚠️", "unknown": "❓"}.get(status, "\U0001F6D1")
             msg = d.get("blacklist_message") or status
-            bad.append(f"  {icon} <b>{name}</b>: {msg}")
-        clean = len(domains) - len(bad)
-        L.append(f"  • {clean}/{len(domains)} domain(s) clean.")
+            bad.append(f"    {icon} {d.get('domain', '?')}: {msg}")
         if bad:
-            L.append("  <b>Flagged:</b>")
+            L.append(f"  \U0001F6E1 Blacklist: {len(bad)}/{len(domains)} flagged")
             L.extend(bad)
         else:
-            L.append("  ✅ All domains clean.")
-
+            L.append(f"  \U0001F6E1 Blacklist: ✅ all {len(domains)} clean")
     return "\n".join(L)
+
+
+def collect_site(url, user, pwd):
+    """Log into one site and return its (label, section_text)."""
+    label = site_label(url)
+    try:
+        a = Annex(url, user, pwd)
+        a.login()
+        ds = a.date_summary()
+        stats = a.activity_stats(to_date=str(date.today()))
+        health = a.domain_health()
+        return label, build_site_section(label, ds, stats, health)
+    except Exception as e:
+        return label, f"\U0001F310 <b>{label}</b>\n  ⚠️ could not read: {e}"
 
 
 # -----------------------------------------------------------------------------
@@ -215,7 +236,6 @@ def send_telegram(cfg, text):
     if not token or token.startswith("PUT_") or not chat_id or chat_id.startswith("PUT_"):
         print("[telegram] not configured - printing instead:\n")
         # strip the simple HTML tags for console readability
-        import re
         print(re.sub(r"</?b>", "", text))
         return False
     r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
@@ -233,23 +253,31 @@ def send_telegram(cfg, text):
 # run
 # -----------------------------------------------------------------------------
 def run_once(cfg, send=True, raw=False):
-    a = Annex(cfg)
-    a.login()
-    ds = a.date_summary()
-    stats = a.activity_stats(to_date=str(date.today()))  # today's figures
-    health = a.domain_health()
+    user = cfg["annex"]["username"]
+    pwd = cfg["annex"]["password"]
+    sites = get_sites(cfg)
 
     if raw:
         import json
-        print(json.dumps({"date_summary": ds, "activity_stats": stats,
-                          "domain_health": health}, indent=2))
+        for url in sites:
+            a = Annex(url, user, pwd)
+            a.login()
+            print(f"===== {site_label(url)} =====")
+            print(json.dumps({"date_summary": a.date_summary(),
+                              "activity_stats": a.activity_stats(to_date=str(date.today())),
+                              "domain_health": a.domain_health()}, indent=2))
         return
 
-    text = build_summary(ds, stats, health)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    sections = [f"\U0001F4E8 <b>Annex Hourly Summary</b> ({ts}) — {len(sites)} sites"]
+    for url in sites:
+        _, section = collect_site(url, user, pwd)
+        sections.append(section)
+    text = "\n\n".join(sections)
+
     if send:
         send_telegram(cfg, text)
     else:
-        import re
         print(re.sub(r"</?b>", "", text))
 
 
