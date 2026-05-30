@@ -1,0 +1,32 @@
+name: Annex hourly Telegram alert
+
+on:
+  schedule:
+    # Runs at the top of every hour (UTC). GitHub may delay it a few minutes.
+    - cron: "0 * * * *"
+  workflow_dispatch:   # lets you run it manually from the Actions tab (for testing)
+
+jobs:
+  send-summary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch dashboard and send Telegram summary
+        env:
+          ANNEX_USERNAME: ${{ secrets.ANNEX_USERNAME }}
+          ANNEX_PASSWORD: ${{ secrets.ANNEX_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+
